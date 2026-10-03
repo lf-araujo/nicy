@@ -27,6 +27,10 @@ altogether. It may cause conflicts.
 $ nimble install nicy
 ```
 
+Git information is read through [libgit2](https://libgit2.org) instead of
+spawning `git` processes, so you need the libgit2 library and headers
+installed (e.g. `libgit2-devel` on Solus/Fedora, `libgit2-dev` on Debian).
+
 Don’t know what that is? New to Nim? Check out the Nim [docs](https://nim-lang.org/documentation.html). `nimble` is packaged with Nim by default.  
 
 ## Quick start
