@@ -130,9 +130,11 @@ proc horizontalRule*(c = '-'): string =
 
 proc tilde*(path: string): string =
   # donated by @misterbianco
-  let home = getHomeDir()
-  if path.startsWith(home):
-    result = "~/" & path.split(home)[1]
+  let home = getHomeDir()          # trailing slash: "/home/luis/"
+  if path == home[0 .. ^2]:
+    result = "~"
+  elif path.startsWith(home):
+    result = "~/" & path[home.len .. ^1]
   else:
     result = path
 

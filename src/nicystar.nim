@@ -15,6 +15,26 @@ import
   strformat,
   strutils
 
+proc abbrev(c: string): string =
+  ## One character, or two when the dir starts with a dot (".c").
+  if c.len > 1 and c[0] == '.':
+    c[0 .. 1]
+  else:
+    c[0 .. 0]
+
+proc shortPath(path: string): string =
+  ## Abbreviated path: intermediate dirs collapse to their first character,
+  ## the last component stays full, home is always ~.
+  ## ~/Documents/OneDrive/Coding/Nim/Programs/nicy -> ~/D/O/C/N/P/nicy
+  let t = tilde(path)
+  let parts = t.split('/')
+  if parts.len <= 2:      # "/", "/tmp", "~/Documents" — nothing to shorten
+    return t
+  result = parts[0]      # "~" or "" (root)
+  for i in 1 ..< parts.len - 1:
+    result.add '/' & abbrev(parts[i])
+  result.add '/' & parts[^1]
+
 when isMainModule:
   let
     failed = paramCount() > 0 and paramStr(1) != "0"
@@ -22,7 +42,7 @@ when isMainModule:
     tag = gitTag()
 
   var segs: seq[string]
-  segs.add color("🏠 " & tilde(getCwd()), cyan, b = true)
+  segs.add color("🏠 " & shortPath(getCurrentDir()) & " ", cyan, b = true)
   if gs.branchName.len > 0:
     segs.add color("🌿 " & gs.branchName, magenta, b = true)
   if tag.len > 0 and tag != gs.branchName:
