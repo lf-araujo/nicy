@@ -209,6 +209,38 @@ proc gitStatus*(dirty, clean: string): string =
   defer: git_status_list_free(list)
   result = if git_status_list_entrycount(list) > 0: dirty else: clean
 
+proc endsWithDescribeSuffix(s: string): bool =
+  ## True for describe output like "v1.0-3-gabc1234" (tag-depth-commit),
+  ## false for an exact tag name like "v1.0" or "v1.0-beta".
+  var i = s.len - 1
+  while i >= 0 and s[i] in {'0'..'9', 'a'..'f'}: dec i
+  if i < 0 or s[i] != 'g' or i == s.len - 1: return false
+  dec i
+  i >= 0 and s[i] == '-'
+
+proc gitTag*(): string =
+  ## The tag pointing exactly at HEAD; empty when HEAD is not on a tag
+  ## or outside a repository.
+  let repo = openRepo()
+  if repo == nil:
+    return
+  defer: git_repository_free(repo)
+  var opts: git_describe_options
+  discard git_describe_options_init(addr opts, 1)
+  opts.describe_strategy = gitDescribeTags
+  var res: ptr git_describe_result = nil
+  if git_describe_workdir(addr res, repo, addr opts) != 0:
+    return          # no tag reachable from HEAD
+  defer: git_describe_result_free(res)
+  var fmtOpts: git_describe_format_options
+  discard git_describe_format_options_init(addr fmtOpts, 1)
+  var buf: git_buf
+  if git_describe_format(addr buf, res, addr fmtOpts) != 0:
+    return
+  defer: git_buf_dispose(addr buf)
+  if buf.data != nil and not endsWithDescribeSuffix($buf.data):
+    result = $buf.data
+
 proc user*(): string =
   result = $getpwuid(getuid()).pw_name
 

@@ -1,9 +1,11 @@
-## nicystar — a starship-look prompt built on nicy's API.
+## nicystar — a starship-flavored prompt in nicy's bracket style.
 ##
-## Line 1: bold cyan ~/cwd, bold purple  branch, red [status] bracket
-## (starship symbols: ✘ conflicted, ! modified, + staged, ? untracked,
-## $ stashed, ⇡n ahead, ⇣n behind).
-## Line 2: ❯ — bold green on success, bold red on failure.
+## ┌─[🏠 ~/cwd][🌿 branch][🏷 tag][✘!?⇡⇣]
+## └─❯   (bold green on success, bold red on failure)
+##
+## The tag segment appears only when HEAD sits exactly on a tag; the status
+## bracket uses starship symbols (✘ conflicted, ! modified, + staged,
+## ? untracked, $ stashed, ⇡n ahead, ⇣n behind).
 ##
 ## Usage: nicystar [exit_status]   (PROMPT_COMMAND passes $? in)
 
@@ -16,12 +18,15 @@ import
 when isMainModule:
   let
     failed = paramCount() > 0 and paramStr(1) != "0"
-    cwd = color(tilde(getCwd()), cyan, b = true)
     gs = newGitStats()
+    tag = gitTag()
 
-  var branch: string
+  var segs: seq[string]
+  segs.add color("🏠 " & tilde(getCwd()), cyan, b = true)
   if gs.branchName.len > 0:
-    branch = color(" " & gs.branchName, magenta, b = true)
+    segs.add color("🌿 " & gs.branchName, magenta, b = true)
+  if tag.len > 0 and tag != gs.branchName:
+    segs.add color("🏷 " & tag, yellow, b = true)
 
   var st: string
   if gs.conflicted > 0: st.add "✘"
@@ -31,10 +36,18 @@ when isMainModule:
   if gs.stash > 0: st.add "$"
   if gs.ahead > 0: st.add fmt"⇡{gs.ahead}"
   if gs.behind > 0: st.add fmt"⇣{gs.behind}"
-  let statusPart = if st.len > 0: color(fmt" [{st}]", red) else: ""
+  if st.len > 0:
+    segs.add color(st, red)
 
-  let promptChar =
-    if failed: color("❯ ", red, b = true)
-    else: color("❯ ", green, b = true)
+  var line1 = color("┌─[", blue)
+  for i, seg in segs:
+    if i > 0:
+      line1.add color("][", blue)
+    line1.add seg
+  line1.add color("]", blue)
 
-  echo fmt"{cwd}{branch}{statusPart}{'\n'}{promptChar}"
+  let line2 = color("└─", blue) &
+      (if failed: color("❯ ", red, b = true)
+       else: color("❯ ", green, b = true))
+
+  echo fmt"{line1}{'\n'}{line2}"
