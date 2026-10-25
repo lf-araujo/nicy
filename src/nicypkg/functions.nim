@@ -1,5 +1,4 @@
 import
-  libgit2,
   os,
   osproc,
   posix,
@@ -150,98 +149,168 @@ proc virtualenv*(): string =
   if env.len == 0:
     result = ""
 
-proc openRepo(): ptr git_repository =
-  ## The repository containing the current directory, or nil.
-  result = nil
-  var buf: git_buf
-  if git_repository_discover(addr buf, ".", 0, nil) != 0:
-    return
-  defer: git_buf_dispose(addr buf)
-  if buf.data != nil:
-    discard git_repository_open(addr result, buf.data)
+# ---------------------------------------------------------------------------
+# Git — shells out to the `git` binary instead of linking libgit2. A single
+# cached `git status --porcelain=v2 --branch` call per prompt provides the
+# branch, upstream, ahead/behind and the status counts; `git describe` is
+# only spawned for detached HEADs and exact tags, and the stash count is
+# read straight from the stash reflog file.
+# ---------------------------------------------------------------------------
 
-proc getGitDetachedBranch(repo: ptr git_repository): string =
-  ## Equivalent of `git describe --tags --always` for a detached HEAD.
-  var opts: git_describe_options
-  discard git_describe_options_init(addr opts, 1)
-  opts.describe_strategy = gitDescribeTags
-  opts.show_commit_oid_as_fallback = 1
-  var res: ptr git_describe_result = nil
-  if git_describe_workdir(addr res, repo, addr opts) != 0:
+var
+  statusOut: string          # cached porcelain output, "" outside a repo
+  statusFetched = false
+  statsCache: GitStats
+  statsParsed = false
+
+proc gitStatusOut(): string =
+  ## `git status --porcelain=v2 --branch` for the current directory,
+  ## fetched once per prompt; empty outside a repository or without git.
+  if not statusFetched:
+    statusFetched = true
+    try:
+      # --no-optional-locks: a prompt must not fight the user's own git
+      # commands over the index lock
+      let (o, code) = execCmdEx(
+          "git --no-optional-locks status --porcelain=v2 --branch 2>/dev/null")
+      if code == 0:
+        statusOut = o
+    except OSError:
+      discard    # git not installed: same as being outside a repository
+  statusOut
+
+proc gitDescribe(args: string): string =
+  ## Output of `git describe <args>`, stripped; "" when git refuses (e.g.
+  ## HEAD is not on a tag with --exact-match).
+  try:
+    let (o, code) = execCmdEx("git describe " & args & " 2>/dev/null")
+    if code == 0:
+      result = o.strip()
+  except OSError:
+    discard
+
+proc gitDirPath(): string =
+  ## The .git directory of the repository containing the current
+  ## directory, honoring GIT_DIR and ".git" pointer files (worktrees,
+  ## submodules); "" when there is no repository.
+  result = getEnv("GIT_DIR")
+  if result.len > 0:
     return
-  defer: git_describe_result_free(res)
-  var fmtOpts: git_describe_format_options
-  discard git_describe_format_options_init(addr fmtOpts, 1)
-  var buf: git_buf
-  if git_describe_format(addr buf, res, addr fmtOpts) != 0:
+  var dir = ""
+  try:
+    dir = getCurrentDir()
+  except OSError:
     return
-  defer: git_buf_dispose(addr buf)
-  if buf.data != nil:
-    result = $buf.data
+  while true:
+    let candidate = dir / ".git"
+    if dirExists(candidate):
+      return candidate
+    if fileExists(candidate):
+      try:
+        for line in readFile(candidate).splitLines():
+          if line.startsWith("gitdir: "):
+            let path = line[8..^1].strip()
+            return if path.isAbsolute: path else: dir / path
+      except OSError, IOError:
+        discard
+      return ""
+    let parent = dir.parentDir()
+    if parent.len == 0 or parent == dir:
+      return ""
+    dir = parent
+
+proc stashCount(): int =
+  ## Number of stashes: one reflog entry per stash on refs/stash, which is
+  ## exactly what `git stash list` reads.
+  let gitdir = gitDirPath()
+  if gitdir.len == 0:
+    return
+  try:
+    for line in readFile(gitdir / "logs" / "refs" / "stash").splitLines():
+      if line.strip().len > 0:
+        inc result
+  except OSError, IOError:
+    discard
+
+proc parseStatus(outp: string): GitStats =
+  ## Fill a GitStats from `git status --porcelain=v2 --branch` output.
+  var head = ""
+  var detached = false
+  var unborn = false
+  for line in outp.splitLines():
+    if line.startsWith("# branch.oid "):
+      if line.endsWith("(initial)"):
+        unborn = true
+    elif line.startsWith("# branch.head "):
+      head = line[14..^1]
+      if head == "(detached)":
+        detached = true
+        head = ""
+    elif line.startsWith("# branch.upstream "):
+      result.remoteRef = line[17..^1]
+    elif line.startsWith("# branch.ab "):
+      let f = line.splitWhitespace()
+      if f.len == 4:
+        try:
+          result.ahead = parseInt(f[2][1..^1])
+          result.behind = parseInt(f[3][1..^1])
+        except ValueError:
+          discard
+    elif line.startsWith("1 ") or line.startsWith("2 "):
+      let xy = line.splitWhitespace()[1]
+      if xy.len == 2:
+        if xy[0] notin {'.', ' '}: inc result.staged
+        if xy[1] notin {'.', ' '}: inc result.changed
+    elif line.startsWith("u "):
+      inc result.conflicted
+    elif line.startsWith("? "):
+      inc result.untracked
+  if detached:
+    let described = gitDescribe("--tags --always")
+    if described.len > 0:
+      result.branchName = described
+      result.detached = true
+    else:
+      result.branchName = "Big Bang"
+  elif unborn:
+    result.branchName = "Big Bang"   # unborn HEAD
+  else:
+    result.branchName = head
+    result.localRef = head
+
+proc gitStats(): GitStats =
+  ## Parsed git status of the current directory, computed once per prompt.
+  if not statsParsed:
+    statsParsed = true
+    let outp = gitStatusOut()
+    if outp.len > 0:
+      statsCache = parseStatus(outp)
+      statsCache.stash = stashCount()
+  statsCache
 
 proc gitBranch*(): string =
   ## Name of the current branch (or the describe of a detached HEAD),
   ## with a trailing space; empty outside a repository.
-  let repo = openRepo()
-  if repo == nil:
+  let gs = gitStats()
+  if gs.branchName.len == 0 or (not gs.detached and gs.localRef.len == 0):
     return
-  defer: git_repository_free(repo)
-  var head: ptr git_reference = nil
-  if git_repository_head(addr head, repo) != 0:
-    return
-  defer: git_reference_free(head)
-  if git_repository_head_detached(repo) == 1:
-    result = getGitDetachedBranch(repo) & " "
-  else:
-    result = $git_reference_shorthand(head) & " "
+  result = gs.branchName & " "
 
 proc gitStatus*(dirty, clean: string): string =
   ## `dirty` if the worktree has any changes (including untracked files),
   ## else `clean`; empty outside a repository.
-  let repo = openRepo()
-  if repo == nil:
+  if gitStatusOut().len == 0:
     return
-  defer: git_repository_free(repo)
-  var opts: git_status_options
-  discard git_status_options_init(addr opts, 1)
-  opts.flags = statusOptIncludeUntracked   # match `git status --porcelain`
-  var list: ptr git_status_list = nil
-  if git_status_list_new(addr list, repo, addr opts) != 0:
-    return
-  defer: git_status_list_free(list)
-  result = if git_status_list_entrycount(list) > 0: dirty else: clean
-
-proc endsWithDescribeSuffix(s: string): bool =
-  ## True for describe output like "v1.0-3-gabc1234" (tag-depth-commit),
-  ## false for an exact tag name like "v1.0" or "v1.0-beta".
-  var i = s.len - 1
-  while i >= 0 and s[i] in {'0'..'9', 'a'..'f'}: dec i
-  if i < 0 or s[i] != 'g' or i == s.len - 1: return false
-  dec i
-  i >= 0 and s[i] == '-'
+  let gs = gitStats()
+  result = if (gs.untracked + gs.changed + gs.staged +
+      gs.conflicted) > 0: dirty else: clean
 
 proc gitTag*(): string =
   ## The tag pointing exactly at HEAD; empty when HEAD is not on a tag
   ## or outside a repository.
-  let repo = openRepo()
-  if repo == nil:
+  if gitStatusOut().len == 0:
     return
-  defer: git_repository_free(repo)
-  var opts: git_describe_options
-  discard git_describe_options_init(addr opts, 1)
-  opts.describe_strategy = gitDescribeTags
-  var res: ptr git_describe_result = nil
-  if git_describe_workdir(addr res, repo, addr opts) != 0:
-    return          # no tag reachable from HEAD
-  defer: git_describe_result_free(res)
-  var fmtOpts: git_describe_format_options
-  discard git_describe_format_options_init(addr fmtOpts, 1)
-  var buf: git_buf
-  if git_describe_format(addr buf, res, addr fmtOpts) != 0:
-    return
-  defer: git_buf_dispose(addr buf)
-  if buf.data != nil and not endsWithDescribeSuffix($buf.data):
-    result = $buf.data
+  result = gitDescribe("--tags --exact-match")
 
 proc user*(): string =
   result = $getpwuid(getuid()).pw_name
@@ -261,72 +330,9 @@ proc returnCondition*(ok: proc(): string, ng: proc(): string,
     delimiter = "."): string =
   result = returnCondition(ok(), ng(), delimiter)
 
-proc getStashCount(repo: ptr git_repository): int =
-  ## Number of stashes: one reflog entry per stash on refs/stash, which is
-  ## exactly what `git stash list` reads.
-  var log: ptr git_reflog = nil
-  if git_reflog_read(addr log, repo, "refs/stash") == 0:
-    defer: git_reflog_free(log)
-    result = git_reflog_entrycount(log).int
-
 proc newGitStats*(): GitStats =
-  ## All git stats for the prompt in a single pass, without spawning `git`.
-  let repo = openRepo()
-  if repo == nil:
-    return
-  defer: git_repository_free(repo)
-
-  var head: ptr git_reference = nil
-  if git_repository_head(addr head, repo) == 0:
-    defer: git_reference_free(head)
-    if git_repository_head_detached(repo) == 1:
-      result.branchName = getGitDetachedBranch(repo)
-      if result.branchName.len > 0:
-        result.detached = true
-      else:
-        result.branchName = "Big Bang"
-    else:
-      result.branchName = $git_reference_shorthand(head)
-      result.localRef = result.branchName
-      var up: ptr git_reference = nil
-      if git_branch_upstream(addr up, head) == 0:
-        defer: git_reference_free(up)
-        result.remoteRef = $git_reference_shorthand(up)
-        let localOid = git_reference_target(head)
-        let upOid = git_reference_target(up)
-        if localOid != nil and upOid != nil:
-          var ahead, behind: csize_t = 0
-          if git_graph_ahead_behind(addr ahead, addr behind, repo,
-              localOid, upOid) == 0:
-            result.ahead = ahead.int
-            result.behind = behind.int
-  else:
-    result.branchName = "Big Bang"   # unborn HEAD
-
-  var opts: git_status_options
-  discard git_status_options_init(addr opts, 1)
-  opts.flags = statusOptIncludeUntracked   # match `git status --porcelain`
-  var list: ptr git_status_list = nil
-  if git_status_list_new(addr list, repo, addr opts) == 0:
-    defer: git_status_list_free(list)
-    for i in 0 ..< git_status_list_entrycount(list).int:
-      let entry = git_status_byindex(list, i.csize_t)
-      if entry == nil:
-        continue
-      let st = entry.status
-      if (st and statusConflicted) != 0:
-        inc result.conflicted
-        continue
-      # WT_NEW means untracked, counted separately below
-      if (st and (statusWtModified or statusWtDeleted or
-                 statusWtTypechange or statusWtRenamed)) != 0:
-        inc result.changed
-      if (st and (statusIndexNew or statusIndexModified or statusIndexDeleted or
-                 statusIndexRenamed or statusIndexTypechange)) != 0:
-        inc result.staged
-      if (st and statusWtNew) != 0:
-        inc result.untracked
-  result.stash = getStashCount(repo)
+  ## All git stats for the prompt in a single pass.
+  gitStats()
 
 proc dirty*(gs: GitStats): bool =
   (gs.untracked + gs.changed + gs.staged + gs.conflicted) > 1
